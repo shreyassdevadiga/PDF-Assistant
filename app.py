@@ -1,50 +1,40 @@
 #!/usr/bin/env python3
 """
-Streamlit-only Voice PDF Assistant — direct browser microphone (no streamlit-webrtc)
+Streamlit-only Voice PDF Assistant — Browser Mic recorder + TTS controls (Feature 1-3)
 
 Requirements:
-    pip install streamlit PyPDF2 pdfplumber SpeechRecognition gTTS streamlit-audiorecorder
+    pip install streamlit PyPDF2 pdfplumber SpeechRecognition gTTS streamlit-audiorecorder pyttsx3
 
 Run:
     streamlit run app.py
 
-Features:
- - Upload PDF, extract per-page text (pdfplumber preferred if installed)
- - Navigate pages (Next / Previous / Go-to)
- - Read page (gTTS -> audio played in browser)
- - Live microphone recording directly in browser (start/stop) using streamlit-audiorecorder
-   -> recorded WAV bytes are sent to Python and transcribed with SpeechRecognition
- - Recognized speech is parsed into commands (next, previous, go to page N, read, search, summarize)
+Notes:
+ - gTTS requires internet and produces MP3 audio.
+ - pyttsx3 works offline and supports rate/volume but must be installed in the same environment.
+ - The in-browser recorder uses streamlit-audiorecorder; if not installed the app shows instructions.
 """
-
 from __future__ import annotations
 import io
 import re
+import tempfile
+import os
 import logging
 from typing import List, Dict, Optional
 
 import streamlit as st
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-logger = logging.getLogger("streamlit_voice_pdf_recorder")
+logger = logging.getLogger("streamlit_voice_pdf_tts")
 
-# ---------- Helper: in-browser recorder component ----------
-# This uses the lightweight streamlit-audiorecorder component.
-# It returns either (None) when no recording, or a tuple: (audio_bytes, sample_rate)
-# The component's API: `from streamlit_audiorecorder import audiorecorder`
-# audiorecorder() returns bytes (wav) when recording stops.
+# Try to import the browser recorder component
 try:
     from streamlit_audiorecorder import audiorecorder  # type: ignore
     _HAS_AUDIOREC = True
 except Exception:
     _HAS_AUDIOREC = False
 
-# ---------- PDF extraction (lazy) ----------
+# ---------- PDF extraction ----------
 def extract_pages_from_bytes(pdf_bytes: bytes, use_pdfplumber: bool = True) -> List[str]:
-    """
-    Extract text from every page of the uploaded PDF.
-    Uses pdfplumber when available (often better), else PyPDF2.
-    """
     texts: List[str] = []
     if use_pdfplumber:
         try:
@@ -55,8 +45,6 @@ def extract_pages_from_bytes(pdf_bytes: bytes, use_pdfplumber: bool = True) -> L
             return texts
         except Exception as e:
             logger.debug("pdfplumber not available or failed: %s", e)
-
-    # PyPDF2 fallback
     try:
         from PyPDF2 import PdfReader  # type: ignore
         reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -70,46 +58,9 @@ def extract_pages_from_bytes(pdf_bytes: bytes, use_pdfplumber: bool = True) -> L
         logger.exception("PDF extraction failed")
         raise RuntimeError(f"PDF extraction failed: {e}") from e
 
-# ---------- Simple PDF handler for external UI (streamlit_ui.py) ----------
-class PDFHandlerError(Exception):
-    """Custom exception for PDFHandler-related errors."""
-
-
-class PDFHandler:
-    """Minimal PDF handler used by streamlit_ui.py.
-
-    It wraps the existing extract_pages_from_bytes() helper to provide
-    page counting and per-page text extraction from a PDF file path.
-    """
-
-    def __init__(self, pdf_path: str, use_pdfplumber: bool = True):
-        self.pdf_path = pdf_path
-        self._use_pdfplumber = use_pdfplumber
-        try:
-            with open(pdf_path, "rb") as f:
-                pdf_bytes = f.read()
-        except Exception as e:
-            raise PDFHandlerError(f"Failed to open PDF '{pdf_path}': {e}") from e
-
-        try:
-            self._pages = extract_pages_from_bytes(pdf_bytes, use_pdfplumber=self._use_pdfplumber)
-        except Exception as e:
-            raise PDFHandlerError(f"Failed to extract PDF pages: {e}") from e
-
-        if not isinstance(self._pages, list):
-            raise PDFHandlerError("PDF extraction did not return a list of page texts.")
-
-    def num_pages(self) -> int:
-        return len(self._pages)
-
-    def extract_text_by_page(self, page_index: int) -> str:
-        try:
-            return self._pages[page_index]
-        except IndexError as e:
-            raise PDFHandlerError(f"Page index out of range: {page_index}") from e
-
-# ---------- TTS ----------
-def generate_tts_mp3_bytes(text: str, lang: str = "en") -> Optional[bytes]:
+# ---------- TTS helpers ----------
+def generate_gtts_mp3_bytes(text: str, lang: str = "en") -> Optional[bytes]:
+    """Generate MP3 bytes using gTTS (requires internet)."""
     try:
         from gtts import gTTS  # type: ignore
     except Exception:
@@ -121,10 +72,58 @@ def generate_tts_mp3_bytes(text: str, lang: str = "en") -> Optional[bytes]:
         buf.seek(0)
         return buf.read()
     except Exception as e:
-        logger.warning("gTTS failed: %s", e)
+        logger.warning("gTTS generation failed: %s", e)
         return None
 
-# ---------- Command parser ----------
+def generate_pyttsx3_audio_bytes(text: str, rate: int = 160, volume: float = 1.0, fmt: str = "wav") -> Optional[bytes]:
+    """
+    Use pyttsx3 to generate audio file (WAV). Returns bytes or None if pyttsx3 not available.
+    Note: pyttsx3.save_to_file -> engine.runAndWait will write to disk; we read and return bytes.
+    """
+    try:
+        import pyttsx3  # type: ignore
+    except Exception:
+        return None
+    try:
+        # write to a temporary file, then read bytes
+        suffix = ".wav" if fmt == "wav" else ".mp3"
+        tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
+        tmp_name = tmp.name
+        tmp.close()
+        engine = pyttsx3.init()
+        try:
+            engine.setProperty("rate", rate)
+        except Exception:
+            pass
+        try:
+            engine.setProperty("volume", volume)
+        except Exception:
+            pass
+        # save_to_file supports wav on many platforms
+        engine.save_to_file(text, tmp_name)
+        engine.runAndWait()
+        # read bytes
+        with open(tmp_name, "rb") as f:
+            data = f.read()
+        try:
+            os.unlink(tmp_name)
+        except Exception:
+            pass
+        return data
+    except Exception as e:
+        logger.exception("pyttsx3 TTS failed: %s", e)
+        return None
+
+# Caching wrapper for TTS generation to avoid regeneration on repeated play
+@st.cache_data(show_spinner=False)
+def cached_gtts(text: str, lang: str) -> Optional[bytes]:
+    return generate_gtts_mp3_bytes(text, lang=lang)
+
+@st.cache_data(show_spinner=False)
+def cached_pyttsx3(text: str, rate: int, volume: float) -> Optional[bytes]:
+    return generate_pyttsx3_audio_bytes(text, rate=rate, volume=volume, fmt="wav")
+
+# ---------- Command parser (same as before) ----------
 def parse_command(recognized_text: str) -> Dict:
     if not recognized_text:
         return {"action":"none"}
@@ -162,22 +161,17 @@ def parse_command(recognized_text: str) -> Dict:
         return {"action":"goto", "page": int(m.group(1))-1}
     return {"action":"unknown", "text": recognized_text}
 
-# ---------- Recognize WAV bytes (SpeechRecognition) ----------
+# ---------- Recognize WAV bytes using SpeechRecognition ----------
 def recognize_wav_bytes(wav_bytes: bytes) -> Optional[str]:
-    """
-    Use SpeechRecognition to transcribe WAV audio bytes using Google Web Speech API.
-    Requires `pip install SpeechRecognition`.
-    """
     try:
         import speech_recognition as sr  # type: ignore
     except Exception:
-        raise RuntimeError("SpeechRecognition is not installed. Install with `pip install SpeechRecognition`.")
-
+        raise RuntimeError("SpeechRecognition not installed. Install with `pip install SpeechRecognition`.")
     r = sr.Recognizer()
     try:
         with sr.AudioFile(io.BytesIO(wav_bytes)) as src:
             audio = r.record(src)
-            text = r.recognize_google(audio)  # online Google Web Speech API
+            text = r.recognize_google(audio)
             return text
     except sr.UnknownValueError:
         return None
@@ -188,20 +182,23 @@ def recognize_wav_bytes(wav_bytes: bytes) -> Optional[str]:
 
 # ---------- Streamlit app ----------
 def streamlit_app():
-    st.set_page_config(page_title="Voice PDF Assistant (Browser Mic)", layout="wide")
-    st.title("Voice Automated PDF Assistant — Browser Microphone Commands")
+    st.set_page_config(page_title="Voice PDF Assistant (TTS + Browser Mic)", layout="wide")
+    st.title("Voice Automated PDF Assistant — TTS Controls & Browser Mic")
 
-    st.markdown("""
-    - Upload a PDF.
-    - Use **Start recording** / **Stop** (in the recorder widget) to capture a short voice command.
-    - The app transcribes the command and executes it: *next*, *previous*, *go to page N*, *read page*, *search for ...*.
-    """)
+    st.markdown(
+        "Upload a PDF, navigate pages, record a short command with your browser mic, "
+        "and use the TTS panel to play or download audio of page text or custom text."
+    )
 
+    # Sidebar settings
     st.sidebar.header("Settings")
     use_pdfplumber = st.sidebar.checkbox("Prefer pdfplumber extraction (if available)", value=True)
-    tts_lang = st.sidebar.text_input("TTS language (gTTS)", value="en")
-    snippet_len = st.sidebar.number_input("Search snippet length", min_value=50, max_value=1000, value=300)
+    tts_engine_choice = st.sidebar.radio("TTS engine", options=["gTTS (online)", "pyttsx3 (offline, if installed)"], index=0)
+    tts_lang = st.sidebar.text_input("gTTS language code (e.g. 'en', 'hi')", value="en")
+    pyttsx3_rate = st.sidebar.slider("pyttsx3 rate (words per minute)", min_value=80, max_value=300, value=160)
+    pyttsx3_volume = st.sidebar.slider("pyttsx3 volume", min_value=0.0, max_value=1.0, value=1.0)
 
+    # Load PDF
     uploaded_pdf = st.file_uploader("Upload a PDF file", type=["pdf"])
     if uploaded_pdf is None:
         st.info("Upload a PDF to begin.")
@@ -222,52 +219,147 @@ def streamlit_app():
     n_pages = len(pages)
     st.success(f"Loaded {uploaded_pdf.name} — {n_pages} pages")
 
-    # session state
+    # page navigation
     if "page_idx" not in st.session_state:
         st.session_state.page_idx = 0
 
-    col1, col2, col3, col4 = st.columns([1,1,1,2])
-    with col1:
+    c1, c2, c3, c4 = st.columns([1,1,1,2])
+    with c1:
         if st.button("Previous"):
             if st.session_state.page_idx > 0:
                 st.session_state.page_idx -= 1
-    with col2:
+    with c2:
         if st.button("Next"):
             if st.session_state.page_idx + 1 < n_pages:
                 st.session_state.page_idx += 1
-    with col3:
-        goto = st.number_input("Go to page (1-indexed)", min_value=1, max_value=max(1,n_pages), value=st.session_state.page_idx+1)
+    with c3:
+        goto_val = st.number_input("Go to page (1-indexed)", min_value=1, max_value=max(1,n_pages), value=st.session_state.page_idx+1)
         if st.button("Go"):
-            st.session_state.page_idx = int(goto)-1
-    with col4:
-        if st.button("Read page (gTTS)"):
-            text = pages[st.session_state.page_idx]
-            if not text:
-                st.info("No text extracted on this page to read.")
-            else:
-                mp3 = generate_tts_mp3_bytes(text[:15000], lang=tts_lang)
-                if mp3:
-                    st.audio(mp3, format="audio/mp3")
-                else:
-                    st.text_area("Page text", value=text, height=400)
+            st.session_state.page_idx = int(goto_val)-1
+    # TTS quick read button moved a bit later into TTS panel
 
     st.markdown("---")
     st.subheader(f"Page {st.session_state.page_idx+1}/{n_pages}")
     page_text = pages[st.session_state.page_idx]
     if not page_text:
         st.info("This page appears to have no extracted text (likely scanned).")
-    st.text_area("Extracted page text", value=page_text, height=350)
+    st.text_area("Extracted page text", value=page_text, height=320)
+
+    st.markdown("---")
+    st.header("Text-to-Speech (TTS) controls")
+
+    # TTS selection: what to read
+    t1, t2 = st.columns([2,1])
+    with t1:
+        tts_target = st.selectbox("TTS source", options=["Current page", "Selection (enter below)", "Custom text"])
+        if tts_target == "Selection (enter below)":
+            selection_text = st.text_area("Enter the text selection to read", value="", height=120)
+        elif tts_target == "Custom text":
+            custom_text = st.text_area("Enter custom text to read", value="", height=120)
+        else:
+            # current page
+            selection_text = ""
+            custom_text = ""
+    with t2:
+        st.markdown("**Engine settings**")
+        st.write(f"Selected engine: **{tts_engine_choice}**")
+        if tts_engine_choice.startswith("gTTS"):
+            st.info("gTTS is online and produces high-quality MP3 audio. Rate slider is not applied to gTTS.")
+        else:
+            # check pyttsx3 availability
+            try:
+                import pyttsx3  # type: ignore
+                _HAS_PYTTSX3 = True
+            except Exception:
+                _HAS_PYTTSX3 = False
+            if not _HAS_PYTTSX3:
+                st.warning("pyttsx3 not installed in this environment. Install `pip install pyttsx3` to use offline TTS.")
+            else:
+                st.write(f"Rate: {pyttsx3_rate}, Volume: {pyttsx3_volume}")
+
+    # Build the final text to speak
+    if tts_target == "Selection (enter below)":
+        text_to_speak = selection_text.strip()
+    elif tts_target == "Custom text":
+        text_to_speak = custom_text.strip()
+    else:
+        text_to_speak = page_text.strip()
+
+    if not text_to_speak:
+        st.info("No text available for TTS. Provide custom text or ensure page has extracted text.")
+    else:
+        # TTS engine selection and play/download buttons
+        cols = st.columns([1,1,1,2])
+        with cols[0]:
+            if st.button("Play TTS"):
+                # choose engine
+                if tts_engine_choice.startswith("gTTS"):
+                    mp3_bytes = cached_gtts(text_to_speak[:30000], tts_lang)  # limit size to keep speed
+                    if mp3_bytes:
+                        st.audio(mp3_bytes, format="audio/mp3")
+                    else:
+                        st.error("gTTS not available or failed. Install `gtts` and ensure internet connectivity.")
+                else:
+                    # pyttsx3 path
+                    try:
+                        import pyttsx3  # type: ignore
+                    except Exception:
+                        st.error("pyttsx3 not installed. Install with `pip install pyttsx3` to use offline TTS.")
+                        mp3_bytes = None
+                    else:
+                        wav_bytes = cached_pyttsx3(text_to_speak[:5000], pyttsx3_rate, pyttsx3_volume)
+                        if wav_bytes:
+                            # pyttsx3 produced WAV bytes: play in browser
+                            st.audio(wav_bytes, format="audio/wav")
+                        else:
+                            st.error("pyttsx3 TTS generation failed.")
+        with cols[1]:
+            if st.button("Download TTS"):
+                # generate bytes then download
+                if tts_engine_choice.startswith("gTTS"):
+                    mp3_bytes = cached_gtts(text_to_speak[:30000], tts_lang)
+                    if mp3_bytes:
+                        st.download_button("Download MP3", data=mp3_bytes, file_name=f"tts_{st.session_state.page_idx+1}.mp3", mime="audio/mpeg")
+                    else:
+                        st.error("gTTS failed. Install gTTS or try again later.")
+                else:
+                    try:
+                        import pyttsx3  # type: ignore
+                    except Exception:
+                        st.error("pyttsx3 not installed. Install with `pip install pyttsx3`.")
+                    else:
+                        wav_bytes = cached_pyttsx3(text_to_speak[:5000], pyttsx3_rate, pyttsx3_volume)
+                        if wav_bytes:
+                            st.download_button("Download WAV", data=wav_bytes, file_name=f"tts_{st.session_state.page_idx+1}.wav", mime="audio/wav")
+                        else:
+                            st.error("pyttsx3 generation failed.")
+        with cols[2]:
+            # Quick preset buttons to read current page or a small summary
+            if st.button("Read current page (quick)"):
+                t = page_text[:800] or "This page has no extracted text."
+                if tts_engine_choice.startswith("gTTS"):
+                    b = cached_gtts(t, tts_lang)
+                    if b:
+                        st.audio(b, format="audio/mp3")
+                    else:
+                        st.error("gTTS failed.")
+                else:
+                    b = cached_pyttsx3(t, pyttsx3_rate, pyttsx3_volume)
+                    if b:
+                        st.audio(b, format="audio/wav")
+                    else:
+                        st.error("pyttsx3 failed.")
+        with cols[3]:
+            st.caption("Tip: Use Play to preview audio. Use Download to save MP3/WAV to device.")
 
     st.markdown("---")
     st.header("Record voice command (browser mic)")
     if not _HAS_AUDIOREC:
-        st.warning("`streamlit-audiorecorder` component is not installed. Install with:\n\npip install streamlit-audiorecorder\n\nAfter install, reload this page.")
-        st.info("Fallback: you can still upload an audio file for commands.")
+        st.warning("`streamlit-audiorecorder` is not installed. Install with:\n\npip install streamlit-audiorecorder\n\nAfter install, reload this page.")
+        st.info("Fallback: you can upload an audio file for commands.")
     else:
-        st.write("Press **Start / Stop** below to record a short voice command (1-8 seconds).")
-        # audiorecorder returns bytes (wav) or None
-        wav_bytes = audiorecorder(duration=8,  # max record duration seconds, adjust as needed
-                                  key="recorder")  # returns wav bytes OR None
+        st.write("Press Start / Stop to record a short voice command (1-8 seconds).")
+        wav_bytes = audiorecorder(duration=8, key="recorder")
         if wav_bytes:
             st.success("Recording captured. Transcribing...")
             try:
@@ -276,12 +368,13 @@ def streamlit_app():
                 st.error(f"Transcription failed: {e}")
                 recognized = None
             if not recognized:
-                st.warning("Could not transcribe audio.")
+                st.warning("Could not transcribe the audio.")
             else:
                 st.success(f"Recognized: {recognized}")
                 cmd = parse_command(recognized)
                 st.write("Parsed command:", cmd)
                 action = cmd.get("action")
+                # Execute parsed command (navigation/read/search)
                 if action == "next":
                     if st.session_state.page_idx + 1 < n_pages:
                         st.session_state.page_idx += 1
@@ -307,11 +400,19 @@ def streamlit_app():
                             if not txt:
                                 st.info("No text on this page to read.")
                             else:
-                                mp3 = generate_tts_mp3_bytes(txt[:15000], lang=tts_lang)
-                                if mp3:
-                                    st.audio(mp3, format="audio/mp3")
+                                # play TTS according to selected engine
+                                if tts_engine_choice.startswith("gTTS"):
+                                    b = cached_gtts(txt[:30000], tts_lang)
+                                    if b:
+                                        st.audio(b, format="audio/mp3")
+                                    else:
+                                        st.error("gTTS failed.")
                                 else:
-                                    st.text_area("Page text", value=txt, height=400)
+                                    b = cached_pyttsx3(txt[:5000], pyttsx3_rate, pyttsx3_volume)
+                                    if b:
+                                        st.audio(b, format="audio/wav")
+                                    else:
+                                        st.error("pyttsx3 failed.")
                         else:
                             st.info(f"Moved to page {page+1}")
                 elif action == "search":
@@ -325,7 +426,7 @@ def streamlit_app():
                             if txt and sq in txt.lower():
                                 idx = txt.lower().find(sq)
                                 start = max(0, idx-60)
-                                snippet = txt[start:start+snippet_len].replace("\n"," ")
+                                snippet = txt[start:start+300].replace("\n"," ")
                                 found.append((i+1, snippet))
                         if found:
                             st.success(f"Found on {len(found)} page(s): {[p for p,_ in found]}")
@@ -334,11 +435,9 @@ def streamlit_app():
                         else:
                             st.info("No results found.")
                 elif action == "summarize":
-                    st.info("Summarization requested — not implemented yet.")
+                    st.info("Summarization requested — not yet implemented.")
                 else:
                     st.info("Unknown or unimplemented command.")
-        else:
-            st.info("No recording yet. Press Start, speak, then Stop.")
 
     st.markdown("---")
     st.header("Fallback: upload audio file (WAV/MP3) for commands")
@@ -348,7 +447,6 @@ def streamlit_app():
         audio_bytes = audio_file.read()
         fname = audio_file.name.lower()
         wav_bytes2 = None
-        # if mp3/etc convert to wav using pydub if installed (optional)
         if fname.endswith(".mp3") or fname.endswith(".ogg") or fname.endswith(".m4a"):
             try:
                 from pydub import AudioSegment  # type: ignore
@@ -358,7 +456,7 @@ def streamlit_app():
                 out.seek(0)
                 wav_bytes2 = out.read()
             except Exception as e:
-                st.error("MP3/OGG conversion failed. Install pydub+ffmpeg or upload WAV file.")
+                st.error("MP3/OGG conversion failed. Install pydub+ffmpeg or upload WAV.")
                 wav_bytes2 = None
         else:
             wav_bytes2 = audio_bytes
@@ -374,8 +472,7 @@ def streamlit_app():
                 st.success(f"Recognized: {recognized}")
                 cmd = parse_command(recognized)
                 st.write("Parsed command:", cmd)
-                # reuse same execution logic as above (for brevity not repeated)
-                # Execute simple navigation/read/search as above
+                # execute same logic as above (navigate/read/search)
                 action = cmd.get("action")
                 if action == "next":
                     if st.session_state.page_idx + 1 < n_pages:
@@ -402,11 +499,18 @@ def streamlit_app():
                             if not txt:
                                 st.info("No text to read.")
                             else:
-                                mp3 = generate_tts_mp3_bytes(txt[:15000], lang=tts_lang)
-                                if mp3:
-                                    st.audio(mp3, format="audio/mp3")
+                                if tts_engine_choice.startswith("gTTS"):
+                                    b = cached_gtts(txt[:30000], tts_lang)
+                                    if b:
+                                        st.audio(b, format="audio/mp3")
+                                    else:
+                                        st.error("gTTS failed.")
                                 else:
-                                    st.text_area("Page text", value=txt, height=400)
+                                    b = cached_pyttsx3(txt[:5000], pyttsx3_rate, pyttsx3_volume)
+                                    if b:
+                                        st.audio(b, format="audio/wav")
+                                    else:
+                                        st.error("pyttsx3 failed.")
                         else:
                             st.info(f"Moved to page {page+1}")
                 elif action == "search":
@@ -420,7 +524,7 @@ def streamlit_app():
                             if txt and sq in txt.lower():
                                 idx = txt.lower().find(sq)
                                 start = max(0, idx-60)
-                                snippet = txt[start:start+snippet_len].replace("\n"," ")
+                                snippet = txt[start:start+300].replace("\n"," ")
                                 found.append((i+1, snippet))
                         if found:
                             st.success(f"Found on {len(found)} page(s): {[p for p,_ in found]}")
@@ -428,14 +532,13 @@ def streamlit_app():
                                 st.markdown(f"**Page {p}** — ...{snip}...")
                         else:
                             st.info("No results found.")
-                elif action == "summarize":
-                    st.info("Summarization requested — not implemented yet.")
                 else:
                     st.info("Unknown or unimplemented command.")
 
     st.markdown("---")
-    st.caption("If the recorder doesn't show up, make sure you installed `streamlit-audiorecorder` and reload the page. For production, use HTTPS (some browsers restrict mic on insecure origins).")
+    st.caption("TTS: gTTS requires internet (online). pyttsx3 is offline but must be installed in the same environment. "
+               "Use 'Play' to preview audio and 'Download' to save files.")
 
-# ---------- Entrypoint ----------
+# Entrypoint
 if __name__ == "__main__":
     streamlit_app()
