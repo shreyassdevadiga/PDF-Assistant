@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Streamlit-only Voice Automated PDF Assistant — All features combined:
-- PDF upload & extraction (pdfplumber / PyPDF2)
-- Browser mic recorder (streamlit-audiorecorder) + file upload fallback
-- Speech recognition (SpeechRecognition + Google Web Speech)
-- Command parsing (next, previous, goto, read, search, summarize scaffold, annotate scaffold)
-- TTS controls: gTTS (online) and pyttsx3 (offline)
-- Search: typed + voice, whole-word/case/fuzzy options, snippets and Go-to
-Save as app.py and run:
+Streamlit-only Voice Automated PDF Assistant — All features combined (go_to_page helper)
+
+- Adds go_to_page(page_number) helper to set page index and attempt to rerun cleanly.
+- Uses go_to_page(...) for every "Go to page" button so search results remain visible
+  after clicking and navigation works in all Streamlit versions.
+
+Usage:
     streamlit run app.py
 """
 
@@ -23,7 +22,7 @@ import difflib
 import streamlit as st
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-logger = logging.getLogger("voice_pdf_assistant_all")
+logger = logging.getLogger("voice_pdf_assistant_all_go_to_helper")
 
 # ---------- optional components detection ----------
 try:
@@ -31,6 +30,21 @@ try:
     _HAS_AUDIOREC = True
 except Exception:
     _HAS_AUDIOREC = False
+
+# ---------- Navigation helper ----------
+def go_to_page(page_number: int):
+    """
+    Set the session page index and attempt to rerun cleanly.
+    Works across Streamlit versions (uses experimental_rerun if available).
+    """
+    st.session_state.page_idx = max(0, page_number - 1)
+    # Try experimental rerun if available for immediate rerun
+    try:
+        if hasattr(st, "experimental_rerun"):
+            st.experimental_rerun()
+    except Exception:
+        # If not available or fails, do nothing — Streamlit will rerun after interaction
+        pass
 
 # ---------- PDF extraction (lazy imports) ----------
 def extract_pages_from_bytes(pdf_bytes: bytes, use_pdfplumber: bool = True) -> List[str]:
@@ -317,8 +331,7 @@ def streamlit_app():
                 c0.markdown(f"**Page {p}**")
                 c1.write("..."+snip+"...")
                 if c2.button("Go to page", key=f"go_{p}"):
-                    st.session_state.page_idx = p-1
-                    st.experimental_rerun()
+                    go_to_page(p)
 
     st.markdown("---")
     # Voice recorder (browser mic) and audio file fallback
@@ -399,8 +412,7 @@ def streamlit_app():
                                 r0.markdown(f"**Page {p}**")
                                 r1.write("..."+snip+"...")
                                 if r2.button("Go to page", key=f"vgo_{p}"):
-                                    st.session_state.page_idx = p-1
-                                    st.experimental_rerun()
+                                    go_to_page(p)
                 elif action in ("highlight","annotate"):
                     st.info(f"{action.capitalize()} command recognized (scaffold). Will add persistent annotations later.")
                 elif action == "summarize":
@@ -502,8 +514,7 @@ def streamlit_app():
                                 s0.markdown(f"**Page {p}**")
                                 s1.write("..."+snip+"...")
                                 if s2.button("Go to page", key=f"ugo_{p}"):
-                                    st.session_state.page_idx = p-1
-                                    st.experimental_rerun()
+                                    go_to_page(p)
                 else:
                     st.info("Unknown or unimplemented command from uploaded audio.")
 
