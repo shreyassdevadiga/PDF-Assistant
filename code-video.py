@@ -113,25 +113,51 @@ def extract_page_number(command):
         st.sidebar.warning("Invalid page command.")
         return None
 
-def listen_for_command(recognizer):
-    while True:
+def listen_for_command(recognizer, timeout=5, retries=3):
+    for attempt in range(retries):
         with sr.Microphone() as source:
-            pyttsx3.speak("Listening for a command...")
-            st.sidebar.info("Listening for a command...")
-            audio = recognizer.listen(source, timeout=10)
             try:
+                # Adjust for ambient noise for better recognition
+                recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                
+                # Speak and show status
+                if attempt == 0:  # Only speak on first attempt
+                    pyttsx3.speak("Listening for a command...")
+                st.sidebar.info("Listening for a command...")
+                
+                # Listen with shorter timeouts for more responsive behavior
+                audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=3)
+                
+                # Process the audio
                 command = recognizer.recognize_google(audio).lower()
-                st.sidebar.info(f"Command: {command}")
-                return command
+                if command:
+                    st.sidebar.info(f"Command: {command}")
+                    return command
+                    
+            except sr.WaitTimeoutError:
+                if attempt < retries - 1:  # Don't show message on last attempt
+                    st.sidebar.info("No command detected. Please speak now...")
+                    continue
+                st.sidebar.warning("No command received. Please try again.")
+                return None
+                
             except sr.UnknownValueError:
+                if attempt < retries - 1:  # Don't show message on last attempt
+                    continue
                 st.sidebar.warning("Could not understand audio. Please try again.")
-                pyttsx3.speak("Could not understand audio. Please try again.")
+                pyttsx3.speak("I couldn't understand that. Please try again.")
+                
             except sr.RequestError as e:
-                st.sidebar.warning(f"Could not request results from Google Speech Recognition service; {e}")
-                pyttsx3.speak(f"Could not request results from Google Speech Recognition service; {e}")
+                st.sidebar.error(f"Speech recognition error: {e}")
+                pyttsx3.speak("Sorry, I'm having trouble with the speech service.")
+                return None
+            
+            except Exception as e:
+                st.sidebar.error(f"Unexpected error: {str(e)}")
+                return None
+    
+    return None  # If all retries fail
 
-            # If the command is not understood, continue listening for a new command
-            continue
 def listen_for_command1(recognizer):
     while True:
         with sr.Microphone() as source:
@@ -240,7 +266,14 @@ def main():
         with sr.Microphone() as source:
             st.sidebar.info("Listening for the file name...")
             pyttsx3.speak("Listening for the file name...")
-            audio = recognizer.listen(source)
+            try:
+                # Adjust for ambient noise and set a timeout
+                recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                audio = recognizer.listen(source, timeout=5, phrase_time_limit=5)
+            except sr.WaitTimeoutError:
+                st.sidebar.warning("No speech detected. Please try again.")
+                pyttsx3.speak("I didn't hear anything. Please try again.")
+                continue
 
             try:
                 file_name = recognizer.recognize_google(audio)
@@ -282,7 +315,7 @@ def main():
 
     with col2:
             while True:
-                command = listen_for_command(recognizer)
+                command = listen_for_command(recognizer, timeout=5, retries=3)
 
                 if "search" in command:
                     search_word = listen_for_search_word(recognizer)
@@ -349,39 +382,59 @@ def main():
 
 
 
-                elif "start navigation" in command:
+                elif "navigation" in command or "start navigation" in command:
                     st.sidebar.info("Starting navigation. You can say 'Next Page', 'Previous Page', or 'Page X'.")
                     pyttsx3.speak("Starting navigation. You can say 'Next Page', 'Previous Page', or 'Page X'.")
 
                     while True:
-                        nav_command = listen_for_command(recognizer)
+                        # Use the improved listen_for_command with timeout and retries
+                        nav_command = listen_for_command(recognizer, timeout=5, retries=2)
 
-                        if nav_command is not None:
+                        if nav_command is None:
+                            st.sidebar.warning("No valid command received. Please try again or say 'stop navigation' to exit.")
+                            pyttsx3.speak("No valid command received. Please try again or say 'stop navigation' to exit.")
+                            continue
+
+                        try:
+                            nav_command = nav_command.lower()
+                            
                             if "next page" in nav_command:
                                 current_page = min(current_page + 1, total_pages - 1)
+                                st.sidebar.info(f"Moving to page {current_page + 1}")
+                                pyttsx3.speak(f"Moving to page {current_page + 1}")
+                                
                             elif "previous page" in nav_command:
                                 current_page = max(current_page - 1, 0)
+                                st.sidebar.info(f"Moving to page {current_page + 1}")
+                                pyttsx3.speak(f"Moving to page {current_page + 1}")
+                                
                             elif "page" in nav_command:
                                 page_number = extract_page_number(nav_command)
-                                if page_number is not None and 0 <= page_number < total_pages:
+                                if page_number is not None and 1 <= page_number <= total_pages:
                                     current_page = page_number - 1
+                                    st.sidebar.info(f"Moving to page {page_number}")
+                                    pyttsx3.speak(f"Moving to page {page_number}")
                                 else:
-                                    st.sidebar.warning("Invalid page command.")
-                                    pyttsx3.speak("Invalid page number.")
+                                    st.sidebar.warning(f"Invalid page number. Please enter a number between 1 and {total_pages}.")
+                                    pyttsx3.speak(f"Invalid page number. Please enter a number between 1 and {total_pages}.")
                                     continue
+                                    
                             elif "stop navigation" in nav_command:
-                                st.sidebar.info("Stopping navigation.")
-                                pyttsx3.speak("Stopping navigation.")
+                                st.sidebar.info("Exiting navigation mode.")
+                                pyttsx3.speak("Exiting navigation mode.")
                                 break
+                                
                             else:
-                                st.sidebar.warning("Invalid navigation command.")
-                                pyttsx3.speak("Invalid navigation command.")
+                                st.sidebar.warning("I didn't understand that command. Please say 'Next Page', 'Previous Page', 'Page X', or 'Stop Navigation'.")
+                                pyttsx3.speak("I didn't understand that command. Please say 'Next Page', 'Previous Page', 'Page X', or 'Stop Navigation'.")
                                 continue
 
+                            # Read the current page
                             read_page(pdf_reader, current_page, speaker, recognizer)
-                        else:
-                            st.warning("No command received. Please try again.")
-                            pyttsx3.speak("No command received. Please try again.")
+                            
+                        except Exception as e:
+                            st.sidebar.error(f"Error processing navigation: {str(e)}")
+                            pyttsx3.speak("Sorry, there was an error processing your command.")
                             continue
                         
                 elif "help" in command:
