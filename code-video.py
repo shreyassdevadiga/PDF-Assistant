@@ -12,6 +12,8 @@ import torch
 import re
 from speech_recognition import WaitTimeoutError , UnknownValueError
 
+#import
+
 # Model and tokenizer loading
 checkpoint = "t5-small"
 tokenizer = T5Tokenizer.from_pretrained(checkpoint)
