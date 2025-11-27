@@ -18,9 +18,60 @@ base_model = T5ForConditionalGeneration.from_pretrained(
     checkpoint, torch_dtype=torch.float32
 )
 
+# ----------------- UTILS: TTS + safe speaking -----------------
+def init_speaker():
+    if "speaker" not in st.session_state:
+        engine = pyttsx3.init()
+        # adjust rate/volume if desired:
+        try:
+            rate = engine.getProperty("rate")
+            engine.setProperty("rate", max(120, rate - 10))
+        except Exception:
+            pass
+        st.session_state.speaker = engine
+
+def speak_text(text, recognizer=None):
+    """
+    Speak using the shared speaker engine while protecting the microphone from
+    picking up the playback by temporarily increasing energy_threshold and disabling
+    dynamic energy calibration.
+    """
+    init_speaker()
+    st.session_state.is_speaking = True
+    speaker = st.session_state.speaker
+
+    # Save recognizer state and raise thresholds if recognizer provided
+    prev_dynamic = None
+    prev_energy = None
+    if recognizer is not None:
+        try:
+            prev_dynamic = recognizer.dynamic_energy_threshold
+            prev_energy = recognizer.energy_threshold
+            recognizer.dynamic_energy_threshold = False
+            # raise energy threshold high enough to ignore TTS playback
+            recognizer.energy_threshold = max(prev_energy * 10, 3000)
+        except Exception:
+            prev_dynamic = None
+            prev_energy = None
+
+    try:
+        speaker.say(text)
+        speaker.runAndWait()
+    except Exception as e:
+        # If TTS fails, show error but continue
+        st.sidebar.error(f"TTS error: {e}")
+    finally:
+        # Restore recognizer thresholds
+        if recognizer is not None and prev_dynamic is not None and prev_energy is not None:
+            try:
+                recognizer.dynamic_energy_threshold = prev_dynamic
+                recognizer.energy_threshold = prev_energy
+            except Exception:
+                pass
+        st.session_state.is_speaking = False
+
 # ----------------- HELPER FUNCTIONS -----------------
 def greet_user(recognizer):
-    speaker = pyttsx3.init()
     greeting_message = (
         "Hello, I am SpeakLink, a virtual assistant at your service. "
         "You can give me commands as soon as I say 'listening for a command.' "
@@ -30,8 +81,8 @@ def greet_user(recognizer):
         "I hope you have a pleasant experience with me!"
     )
     st.sidebar.info(greeting_message)
-    speaker.say(greeting_message)
-    speaker.runAndWait()
+    # Use speak_text to avoid mic pickup
+    speak_text(greeting_message, recognizer=recognizer)
 
 def file_preprocessing(file):
     loader = PyPDFLoader(file)
@@ -119,7 +170,11 @@ def extract_page_number(command):
         return None
 
 def listen_for_command(recognizer, timeout=5, retries=3):
-    # Do not listen while speaking summary or other long content
+    """
+    Primary listening function used in main loop. It respects the is_speaking flag.
+    Returns recognized command (lowercase string) or None.
+    """
+    # If currently speaking, avoid listening
     if st.session_state.get("is_speaking", False):
         return None
 
@@ -127,10 +182,10 @@ def listen_for_command(recognizer, timeout=5, retries=3):
         with sr.Microphone() as source:
             try:
                 recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                if attempt == 0:
-                    pyttsx3.speak("Listening for a command...")
+                # Announce listening (but keep recognizer protected inside speak_text)
+                speak_text("Listening for a command...", recognizer=recognizer)
                 st.sidebar.info("Listening for a command...")
-                audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=3)
+                audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=5)
                 command = recognizer.recognize_google(audio).lower()
                 if command:
                     st.sidebar.info(f"Command: {command}")
@@ -145,10 +200,10 @@ def listen_for_command(recognizer, timeout=5, retries=3):
                 if attempt < retries - 1:
                     continue
                 st.sidebar.warning("Could not understand audio. Please try again.")
-                pyttsx3.speak("I couldn't understand that. Please try again.")
+                speak_text("I couldn't understand that. Please try again.", recognizer=recognizer)
             except sr.RequestError as e:
                 st.sidebar.error(f"Speech recognition error: {e}")
-                pyttsx3.speak("Sorry, I'm having trouble with the speech service.")
+                speak_text("Sorry, I'm having trouble with the speech service.", recognizer=recognizer)
                 return None
             except Exception as e:
                 st.sidebar.error(f"Unexpected error: {str(e)}")
@@ -156,26 +211,32 @@ def listen_for_command(recognizer, timeout=5, retries=3):
     return None
 
 def listen_for_command1(recognizer):
-    # Do not listen while speaking summary or other long content
+    """
+    Short quick-listen used when reading page-by-page to detect a 'stop' command.
+    Returns recognized command string or 'none'
+    """
     if st.session_state.get("is_speaking", False):
         return "none"
 
-    while True:
-        with sr.Microphone() as source:
-            try:
-                audio = recognizer.listen(source, timeout=1)
-                command = recognizer.recognize_google(audio).lower()
-                st.sidebar.info(f"Command: {command}")
-                return command
-            except WaitTimeoutError:
-                return "none"
-            except UnknownValueError:
-                return "none"
+    with sr.Microphone() as source:
+        try:
+            audio = recognizer.listen(source, timeout=1, phrase_time_limit=2)
+            command = recognizer.recognize_google(audio).lower()
+            st.sidebar.info(f"Command: {command}")
+            return command
+        except WaitTimeoutError:
+            return "none"
+        except UnknownValueError:
+            return "none"
+        except sr.RequestError:
+            return "none"
+        except Exception:
+            return "none"
 
 def listen_for_question(recognizer):
     while True:
         with sr.Microphone() as source:
-            pyttsx3.speak("Listening for your question...")
+            speak_text("Listening for your question...", recognizer=recognizer)
             st.sidebar.info("Listening for your question...")
             audio = recognizer.listen(source, timeout=10)
             try:
@@ -184,13 +245,14 @@ def listen_for_question(recognizer):
                 return command
             except sr.UnknownValueError:
                 st.sidebar.warning("Could not understand audio. Please try again.")
-                pyttsx3.speak("Could not understand audio. Please try again.")
+                speak_text("Could not understand audio. Please try again.", recognizer=recognizer)
             except sr.RequestError as e:
                 st.sidebar.warning(
                     f"Could not request results from Google Speech Recognition service; {e}"
                 )
-                pyttsx3.speak(
-                    f"Could not request results from Google Speech Recognition service; {e}"
+                speak_text(
+                    f"Could not request results from Google Speech Recognition service; {e}",
+                    recognizer=recognizer,
                 )
             continue
 
@@ -200,28 +262,28 @@ def read_page(pdf_reader, page_number, speaker, recognizer):
     sentences = text.split(".")
     for sentence in sentences:
         if sentence.strip():
-            speaker.say(sentence)
-            speaker.runAndWait()
+            # use speak_text to protect microphone
+            speak_text(sentence.strip(), recognizer=recognizer)
         stop_command = listen_for_command1(recognizer)
         if stop_command and "stop" in stop_command:
             st.sidebar.info("Stopping reading...")
-            pyttsx3.speak("Stopping reading...")
+            speak_text("Stopping reading...", recognizer=recognizer)
             return
 
-def read_summarized_content(summary, speaker):
-    # Block listening while speaking summary
-    st.session_state.is_speaking = True
-    try:
-        speaker.say("Reading the summarised content.")
-        speaker.say(summary)
-        speaker.runAndWait()
-    finally:
-        st.session_state.is_speaking = False
+def read_summarized_content(summary, recognizer):
+    # Use speak_text which blocks and protects microphone
+    speak_text("Reading the summarised content.", recognizer=recognizer)
+    # speak the summary in reasonably sized chunks (to avoid very long TTS queue)
+    # split summary into sentence-ish chunks:
+    chunks = re.split(r'(?<=[.!?]) +', summary)
+    for chunk in chunks:
+        if chunk.strip():
+            speak_text(chunk.strip(), recognizer=recognizer)
 
 def listen_for_search_word(recognizer):
     while True:
         with sr.Microphone() as source:
-            pyttsx3.speak("Please speak the word you want to search for.")
+            speak_text("Please speak the word you want to search for.", recognizer=recognizer)
             st.sidebar.info("Please speak the word you want to search for.")
             audio = recognizer.listen(source, timeout=10)
             try:
@@ -230,13 +292,14 @@ def listen_for_search_word(recognizer):
                 return search_word
             except sr.UnknownValueError:
                 st.sidebar.warning("Could not understand the word. Please try again.")
-                pyttsx3.speak("Could not understand the word. Please try again.")
+                speak_text("Could not understand the word. Please try again.", recognizer=recognizer)
             except sr.RequestError as e:
                 st.sidebar.warning(
                     f"Could not request results from Google Speech Recognition service; {e}"
                 )
-                pyttsx3.speak(
-                    f"Could not request results from Google Speech Recognition service; {e}"
+                speak_text(
+                    f"Could not request results from Google Speech Recognition service; {e}",
+                    recognizer=recognizer
                 )
             continue
 
@@ -253,7 +316,7 @@ def search_word_in_pdf(filepath, search_word):
 
 def listen_for_note(recognizer):
     with sr.Microphone() as source:
-        pyttsx3.speak("Please speak your note.")
+        speak_text("Please speak your note.", recognizer=recognizer)
         st.sidebar.info("Please speak your note.")
         audio = recognizer.listen(source, timeout=10)
         try:
@@ -262,11 +325,11 @@ def listen_for_note(recognizer):
             return note
         except sr.UnknownValueError:
             st.sidebar.warning("Could not understand the note. Please try again.")
-            pyttsx3.speak("Could not understand the note. Please try again.")
+            speak_text("Could not understand the note. Please try again.", recognizer=recognizer)
             return None
         except sr.RequestError as e:
             st.sidebar.warning(f"Error from speech service: {e}")
-            pyttsx3.speak("Sorry, there was an error with the speech service.")
+            speak_text("Sorry, there was an error with the speech service.", recognizer=recognizer)
             return None
 
 def add_highlight(page_index, text_snippet):
@@ -275,7 +338,8 @@ def add_highlight(page_index, text_snippet):
         st.session_state.highlights[page_index] = []
     st.session_state.highlights[page_index].append(text_snippet)
     st.sidebar.success(f"Highlighted on page {page_index + 1}.")
-    pyttsx3.speak(f"Highlighted on page {page_index + 1}.")
+    # speak feedback
+    speak_text(f"Highlighted on page {page_index + 1}.")
 
 def add_annotation(page_index, note_text):
     page_index = int(page_index)
@@ -283,7 +347,7 @@ def add_annotation(page_index, note_text):
         st.session_state.annotations[page_index] = []
     st.session_state.annotations[page_index].append(note_text)
     st.sidebar.success(f"Note added on page {page_index + 1}.")
-    pyttsx3.speak(f"Note added on page {page_index + 1}.")
+    speak_text(f"Note added on page {page_index + 1}.")
 
 # ----------------- MAIN APP -----------------
 st.set_page_config(layout="wide")
@@ -291,8 +355,9 @@ st.set_page_config(layout="wide")
 def main():
     st.title("SPEAKLINK : Voice Automated PDF Assistant for the Visually Impaired")
 
+    # Initialize recognizer and shared speaker
     recognizer = sr.Recognizer()
-    speaker = pyttsx3.init()
+    init_speaker()
 
     if "highlights" not in st.session_state:
         st.session_state.highlights = {}
@@ -309,13 +374,13 @@ def main():
     while True:
         with sr.Microphone() as source:
             st.sidebar.info("Listening for the file name...")
-            pyttsx3.speak("Listening for the file name...")
+            speak_text("Listening for the file name...", recognizer=recognizer)
             try:
                 recognizer.adjust_for_ambient_noise(source, duration=0.5)
                 audio = recognizer.listen(source, timeout=5, phrase_time_limit=5)
             except sr.WaitTimeoutError:
                 st.sidebar.warning("No speech detected. Please try again.")
-                pyttsx3.speak("I didn't hear anything. Please try again.")
+                speak_text("I didn't hear anything. Please try again.", recognizer=recognizer)
                 continue
 
         try:
@@ -326,20 +391,21 @@ def main():
 
             if file_name.lower() == "quit":
                 st.sidebar.info("Exiting the program...")
-                pyttsx3.speak("Exiting the program...")
+                speak_text("Exiting the program...", recognizer=recognizer)
                 return
 
             filepath = os.path.join("data", file_name.strip() + ".pdf")
 
             if os.path.exists(filepath):
-                pyttsx3.speak("File uploaded successfully")
+                speak_text("File uploaded successfully", recognizer=recognizer)
                 break
             else:
                 st.sidebar.error(
                     f"File '{file_name}.pdf' does not exist. Please try again or say 'quit' to exit."
                 )
-                pyttsx3.speak(
-                    f"File '{file_name}.pdf' does not exist. Please try again or say 'quit' to exit."
+                speak_text(
+                    f"File '{file_name}.pdf' does not exist. Please try again or say 'quit' to exit.",
+                    recognizer=recognizer
                 )
 
         except sr.UnknownValueError:
@@ -387,63 +453,59 @@ def main():
                     st.sidebar.success(
                         f"Word '{search_word}' found on page(s): {pages_str}"
                     )
-                    pyttsx3.speak(
-                        f"Word '{search_word}' found on page(s): {pages_str}"
-                    )
+                    speak_text(f"Word '{search_word}' found on page(s): {pages_str}", recognizer=recognizer)
                 else:
                     st.sidebar.warning(
                         f"Word '{search_word}' not found in the document."
                     )
-                    pyttsx3.speak(
-                        f"Word '{search_word}' not found in the document."
+                    speak_text(
+                        f"Word '{search_word}' not found in the document.", recognizer=recognizer
                     )
 
             # -------- QUERY / QA --------
             elif "query" in command:
                 if not querying:
                     st.sidebar.info("Starting querying feature. Please ask your question.")
-                    pyttsx3.speak("Starting querying feature. Please ask your question.")
+                    speak_text("Starting querying feature. Please ask your question.", recognizer=recognizer)
                     querying = True
 
                 while querying:
                     question = listen_for_question(recognizer)
                     if "stop" in question:
                         st.sidebar.info("Stopping querying feature.")
-                        pyttsx3.speak("Stopping querying feature.")
+                        speak_text("Stopping querying feature.", recognizer=recognizer)
                         querying = False
                         break
                     else:
                         answer = answer_query_t5(question, full_text)
                         st.success(f"Answer: {answer}")
-                        pyttsx3.speak(answer)
+                        speak_text(answer, recognizer=recognizer)
 
             # -------- PAGE SUMMARY --------
             elif "summarize page" in command or "summarise page" in command:
                 page_text = pdf_reader.pages[current_page].extract_text() or ""
                 if not page_text.strip():
                     st.sidebar.warning("No text found on this page to summarize.")
-                    pyttsx3.speak("No text found on this page to summarize.")
+                    speak_text("No text found on this page to summarize.", recognizer=recognizer)
                 else:
                     st.sidebar.info(f"Summarizing page {current_page + 1}...")
-                    pyttsx3.speak(
-                        f"Summarizing page {current_page + 1}. Please wait."
-                    )
+                    speak_text(f"Summarizing page {current_page + 1}. Please wait.", recognizer=recognizer)
                     page_summary = summarize_text_with_t5(page_text)
                     st.success(page_summary)
-                    read_summarized_content(page_summary, speaker)
+                    read_summarized_content(page_summary, recognizer=recognizer)
 
             # -------- DOCUMENT SUMMARY --------
             elif "summarize" in command or "summarise" in command:
                 st.sidebar.info("Summarizing document...")
-                pyttsx3.speak("Summarizing the document. Please wait.")
+                speak_text("Summarizing the document. Please wait.", recognizer=recognizer)
                 try:
                     summary = summarize_text_with_t5(full_text)
                     st.success(summary)
-                    read_summarized_content(summary, speaker)
+                    read_summarized_content(summary, recognizer=recognizer)
                 except Exception as e:
                     st.sidebar.error(f"Error while summarizing: {e}")
-                    pyttsx3.speak(
-                        "Sorry, there was an error while summarizing the document."
+                    speak_text(
+                        "Sorry, there was an error while summarizing the document.", recognizer=recognizer
                     )
 
             # -------- READ ALOUD ALL PAGES --------
@@ -457,12 +519,11 @@ def main():
                     stop_flag = False
                     for sentence in sentences:
                         if sentence.strip():
-                            speaker.say(sentence)
-                            speaker.runAndWait()
+                            speak_text(sentence.strip(), recognizer=recognizer)
                         cmd = listen_for_command1(recognizer)
                         if cmd and "stop" in cmd:
                             st.sidebar.info("Stopping reading...")
-                            pyttsx3.speak("Stopping reading...")
+                            speak_text("Stopping reading...", recognizer=recognizer)
                             stop_flag = True
                             break
                     if stop_flag:
@@ -475,8 +536,9 @@ def main():
                 st.sidebar.info(
                     "Starting navigation. You can say 'Next Page', 'Previous Page', or 'Page X'."
                 )
-                pyttsx3.speak(
-                    "Starting navigation. You can say 'Next Page', 'Previous Page', or 'Page X'."
+                speak_text(
+                    "Starting navigation. You can say 'Next Page', 'Previous Page', or 'Page X'.",
+                    recognizer=recognizer
                 )
 
                 while True:
@@ -485,8 +547,9 @@ def main():
                         st.sidebar.warning(
                             "No valid command received. Please try again or say 'stop navigation' to exit."
                         )
-                        pyttsx3.speak(
-                            "No valid command received. Please try again or say 'stop navigation' to exit."
+                        speak_text(
+                            "No valid command received. Please try again or say 'stop navigation' to exit.",
+                            recognizer=recognizer
                         )
                         continue
 
@@ -496,48 +559,50 @@ def main():
                         if "next page" in nav_command:
                             current_page = min(current_page + 1, total_pages - 1)
                             st.sidebar.info(f"Moving to page {current_page + 1}")
-                            pyttsx3.speak(f"Moving to page {current_page + 1}")
+                            speak_text(f"Moving to page {current_page + 1}", recognizer=recognizer)
 
                         elif "previous page" in nav_command:
                             current_page = max(current_page - 1, 0)
                             st.sidebar.info(f"Moving to page {current_page + 1}")
-                            pyttsx3.speak(f"Moving to page {current_page + 1}")
+                            speak_text(f"Moving to page {current_page + 1}", recognizer=recognizer)
 
                         elif "page" in nav_command:
                             page_number = extract_page_number(nav_command)
                             if page_number is not None and 1 <= page_number <= total_pages:
                                 current_page = page_number - 1
                                 st.sidebar.info(f"Moving to page {page_number}")
-                                pyttsx3.speak(f"Moving to page {page_number}")
+                                speak_text(f"Moving to page {page_number}", recognizer=recognizer)
                             else:
                                 st.sidebar.warning(
                                     f"Invalid page number. Please enter a number between 1 and {total_pages}."
                                 )
-                                pyttsx3.speak(
-                                    f"Invalid page number. Please enter a number between 1 and {total_pages}."
+                                speak_text(
+                                    f"Invalid page number. Please enter a number between 1 and {total_pages}.",
+                                    recognizer=recognizer
                                 )
                                 continue
 
                         elif "stop navigation" in nav_command:
                             st.sidebar.info("Exiting navigation mode.")
-                            pyttsx3.speak("Exiting navigation mode.")
+                            speak_text("Exiting navigation mode.", recognizer=recognizer)
                             break
 
                         else:
                             st.sidebar.warning(
                                 "I didn't understand that command. Please say 'Next Page', 'Previous Page', 'Page X', or 'Stop Navigation'."
                             )
-                            pyttsx3.speak(
-                                "I didn't understand that command. Please say 'Next Page', 'Previous Page', 'Page X', or 'Stop Navigation'."
+                            speak_text(
+                                "I didn't understand that command. Please say 'Next Page', 'Previous Page', 'Page X', or 'Stop Navigation'.",
+                                recognizer=recognizer
                             )
                             continue
 
-                        read_page(pdf_reader, current_page, speaker, recognizer)
+                        read_page(pdf_reader, current_page, st.session_state.speaker, recognizer)
 
                     except Exception as e:
                         st.sidebar.error(f"Error processing navigation: {str(e)}")
-                        pyttsx3.speak(
-                            "Sorry, there was an error processing your command."
+                        speak_text(
+                            "Sorry, there was an error processing your command.", recognizer=recognizer
                         )
                         continue
 
@@ -556,7 +621,7 @@ def main():
             # -------- HELP --------
             elif "help" in command:
                 st.sidebar.info("Please let me know with which command I can help you!")
-                pyttsx3.speak("Please let me know with which command I can help you!")
+                speak_text("Please let me know with which command I can help you!", recognizer=recognizer)
 
                 while True:
                     hcommand = listen_for_command(recognizer)
@@ -567,15 +632,17 @@ def main():
                         st.sidebar.info(
                             "To read a specific page, say 'start navigation' followed by the page number."
                         )
-                        pyttsx3.speak(
-                            "To read a specific page, say 'start navigation' followed by the page number."
+                        speak_text(
+                            "To read a specific page, say 'start navigation' followed by the page number.",
+                            recognizer=recognizer
                         )
                         continue
 
                     if "read" in hcommand:
                         st.sidebar.info("To read aloud the entire file, say 'read aloud'.")
-                        pyttsx3.speak(
-                            "To read aloud the entire file, say 'read aloud'."
+                        speak_text(
+                            "To read aloud the entire file, say 'read aloud'.",
+                            recognizer=recognizer
                         )
                         continue
 
@@ -583,8 +650,9 @@ def main():
                         st.sidebar.info(
                             "To summarize only the current page, say 'summarize page'."
                         )
-                        pyttsx3.speak(
-                            "To summarize only the current page, say 'summarize page'."
+                        speak_text(
+                            "To summarize only the current page, say 'summarize page'.",
+                            recognizer=recognizer
                         )
                         continue
 
@@ -592,8 +660,9 @@ def main():
                         st.sidebar.info(
                             "To summarize the entire file, say 'summarize'."
                         )
-                        pyttsx3.speak(
-                            "To summarize the entire file, say 'summarize'."
+                        speak_text(
+                            "To summarize the entire file, say 'summarize'.",
+                            recognizer=recognizer
                         )
                         continue
 
@@ -601,8 +670,9 @@ def main():
                         st.sidebar.info(
                             "To search for a specific word in the file, say 'search' and then speak the word."
                         )
-                        pyttsx3.speak(
-                            "To search for a specific word in the file, say search and then speak the word."
+                        speak_text(
+                            "To search for a specific word in the file, say search and then speak the word.",
+                            recognizer=recognizer
                         )
                         continue
 
@@ -610,8 +680,9 @@ def main():
                         st.sidebar.info(
                             "To query the file, say 'query' and then ask your question."
                         )
-                        pyttsx3.speak(
-                            "To query the file, say query and then ask your question."
+                        speak_text(
+                            "To query the file, say query and then ask your question.",
+                            recognizer=recognizer
                         )
                         continue
 
@@ -619,8 +690,9 @@ def main():
                         st.sidebar.info(
                             "Starting navigation. You can say 'Next Page', 'Previous Page', or 'Page X'."
                         )
-                        pyttsx3.speak(
-                            "Starting navigation. You can say 'Next Page', 'Previous Page', or 'Page X'."
+                        speak_text(
+                            "Starting navigation. You can say 'Next Page', 'Previous Page', or 'Page X'.",
+                            recognizer=recognizer
                         )
                         continue
 
@@ -628,8 +700,8 @@ def main():
                         st.sidebar.info(
                             "To highlight the current page, say 'highlight'."
                         )
-                        pyttsx3.speak(
-                            "To highlight the current page, say highlight."
+                        speak_text(
+                            "To highlight the current page, say highlight.", recognizer=recognizer
                         )
                         continue
 
@@ -637,8 +709,8 @@ def main():
                         st.sidebar.info(
                             "To add a note on the current page, say 'note' and then speak your note."
                         )
-                        pyttsx3.speak(
-                            "To add a note on the current page, say note and then speak your note."
+                        speak_text(
+                            "To add a note on the current page, say note and then speak your note.", recognizer=recognizer
                         )
                         continue
 
@@ -646,12 +718,12 @@ def main():
                         phrase in hcommand for phrase in ["exit help", "stop help"]
                     ):
                         st.sidebar.info("Stopping help feature.")
-                        pyttsx3.speak("Stopping help feature.")
+                        speak_text("Stopping help feature.", recognizer=recognizer)
                         break
 
                     else:
                         st.sidebar.info("Invalid command, please try again")
-                        pyttsx3.speak("Invalid command, please try again")
+                        speak_text("Invalid command, please try again", recognizer=recognizer)
                         continue
 
             # -------- STOP / EXIT ASSISTANT --------
@@ -668,13 +740,13 @@ def main():
                 ]
             ):
                 st.sidebar.info("Stopping assistant.")
-                pyttsx3.speak("Stopping assistant.")
+                speak_text("Stopping assistant.", recognizer=recognizer)
                 break
 
             # -------- INVALID COMMAND --------
             else:
                 st.sidebar.warning("Invalid command.")
-                pyttsx3.speak("Invalid command.")
+                speak_text("Invalid command.", recognizer=recognizer)
                 continue
 
 if __name__ == "__main__":
